@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Attributes;
@@ -17,6 +19,7 @@ using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Extensions;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Common.Extensions;
+using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Collections;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
@@ -58,6 +61,7 @@ public class LibraryController : BaseJellyfinApiController
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly ILogger<LibraryController> _logger;
     private readonly IServerConfigurationManager _serverConfigurationManager;
+    private readonly IHttpClientFactory _httpClientFactory;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="LibraryController"/> class.
@@ -73,6 +77,7 @@ public class LibraryController : BaseJellyfinApiController
     /// <param name="libraryMonitor">Instance of the <see cref="ILibraryMonitor"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger{LibraryController}"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
+    /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
     public LibraryController(
         IProviderManager providerManager,
         ISimilarItemsManager similarItemsManager,
@@ -84,7 +89,8 @@ public class LibraryController : BaseJellyfinApiController
         ILocalizationManager localization,
         ILibraryMonitor libraryMonitor,
         ILogger<LibraryController> logger,
-        IServerConfigurationManager serverConfigurationManager)
+        IServerConfigurationManager serverConfigurationManager,
+        IHttpClientFactory httpClientFactory)
     {
         _providerManager = providerManager;
         _similarItemsManager = similarItemsManager;
@@ -97,6 +103,7 @@ public class LibraryController : BaseJellyfinApiController
         _libraryMonitor = libraryMonitor;
         _logger = logger;
         _serverConfigurationManager = serverConfigurationManager;
+        _httpClientFactory = httpClientFactory;
     }
 
     /// <summary>
@@ -703,6 +710,26 @@ public class LibraryController : BaseJellyfinApiController
             await LogDownloadAsync(item, user).ConfigureAwait(false);
         }
 
+        if (item.IsShortcut
+            && Uri.TryCreate(item.ShortcutPath, UriKind.Absolute, out var shortcutUri)
+            && (shortcutUri.Scheme == Uri.UriSchemeHttp || shortcutUri.Scheme == Uri.UriSchemeHttps))
+        {
+            var httpClient = _httpClientFactory.CreateClient(NamedClient.Default);
+            var result = await FileStreamResponseHelpers.GetStaticRemoteStreamResult(
+                shortcutUri,
+                new Dictionary<string, string>(),
+                httpClient,
+                HttpContext,
+                HttpContext.RequestAborted).ConfigureAwait(false);
+
+            if (result is FileStreamResult fileResult)
+            {
+                fileResult.FileDownloadName = GetShortcutDownloadName(item, shortcutUri, fileResult.ContentType);
+            }
+
+            return result;
+        }
+
         // Quotes are valid in linux. They'll possibly cause issues here.
         var filename = Path.GetFileName(item.Path)?.Replace("\"", string.Empty, StringComparison.Ordinal);
 
@@ -993,6 +1020,38 @@ public class LibraryController : BaseJellyfinApiController
                 .FirstOrDefault(i => i.PhysicalLocations.Contains(item.Path))
             : item;
     }
+
+    /// <summary>
+    /// Gets the file name to use when downloading the remote source of a .strm item.
+    /// </summary>
+    /// <param name="item">The .strm item.</param>
+    /// <param name="shortcutUri">The remote source the .strm file points to.</param>
+    /// <param name="contentType">The content type returned by the remote source.</param>
+    /// <returns>The name of the .strm file with the extension of the remote media.</returns>
+    internal static string GetShortcutDownloadName(BaseItem item, Uri shortcutUri, string? contentType)
+    {
+        var name = Path.GetFileNameWithoutExtension(item.Path).Replace("\"", string.Empty, StringComparison.Ordinal);
+
+        if (IsMediaMimeType(MimeTypes.GetMimeType(shortcutUri.AbsolutePath, null)))
+        {
+            return name + Path.GetExtension(shortcutUri.AbsolutePath);
+        }
+
+        if (IsMediaMimeType(contentType) && MimeTypes.ToExtension(contentType) is { } extension)
+        {
+            return name + extension;
+        }
+
+        // Probed containers can be a list like "mov,mp4,m4a,3gp,3g2,mj2"
+        var containers = item.Container?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) ?? [];
+        var container = containers.FirstOrDefault(c => c.Equals("mp4", StringComparison.OrdinalIgnoreCase)) ?? containers.FirstOrDefault();
+
+        return string.IsNullOrEmpty(container) ? name : name + "." + container;
+    }
+
+    private static bool IsMediaMimeType([NotNullWhen(true)] string? mimeType)
+        => mimeType is not null
+            && (mimeType.StartsWith("video/", StringComparison.OrdinalIgnoreCase) || mimeType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase));
 
     private async Task LogDownloadAsync(BaseItem item, User user)
     {

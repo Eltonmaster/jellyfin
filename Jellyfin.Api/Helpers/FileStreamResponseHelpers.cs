@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Net.Mime;
@@ -26,16 +27,33 @@ public static class FileStreamResponseHelpers
     /// <param name="httpContext">The current http context.</param>
     /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation.</param>
     /// <returns>A <see cref="Task{ActionResult}"/> containing the API response.</returns>
-    public static async Task<ActionResult> GetStaticRemoteStreamResult(
+    public static Task<ActionResult> GetStaticRemoteStreamResult(
         StreamState state,
         HttpClient httpClient,
         HttpContext httpContext,
         CancellationToken cancellationToken = default)
+        => GetStaticRemoteStreamResult(new Uri(state.MediaPath), state.RemoteHttpHeaders, httpClient, httpContext, cancellationToken);
+
+    /// <summary>
+    /// Returns a static file from a remote source.
+    /// </summary>
+    /// <param name="mediaUri">The <see cref="Uri"/> of the remote source.</param>
+    /// <param name="remoteHttpHeaders">The http headers required by the remote source.</param>
+    /// <param name="httpClient">The <see cref="HttpClient"/> making the remote request.</param>
+    /// <param name="httpContext">The current http context.</param>
+    /// <param name="cancellationToken">A cancellation token that can be used to cancel the operation.</param>
+    /// <returns>A <see cref="Task{ActionResult}"/> containing the API response.</returns>
+    public static async Task<ActionResult> GetStaticRemoteStreamResult(
+        Uri mediaUri,
+        IReadOnlyDictionary<string, string> remoteHttpHeaders,
+        HttpClient httpClient,
+        HttpContext httpContext,
+        CancellationToken cancellationToken = default)
     {
-        using var requestMessage = new HttpRequestMessage(HttpMethod.Get, new Uri(state.MediaPath));
+        using var requestMessage = new HttpRequestMessage(HttpMethod.Get, mediaUri);
 
         // Forward User-Agent if provided
-        if (state.RemoteHttpHeaders.TryGetValue(HeaderNames.UserAgent, out var useragent))
+        if (remoteHttpHeaders.TryGetValue(HeaderNames.UserAgent, out var useragent))
         {
             // Clear default and add specific one if exists, otherwise HttpClient default might be used
             requestMessage.Headers.UserAgent.Clear();
