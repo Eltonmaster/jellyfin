@@ -1,0 +1,133 @@
+name: Build patched image
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Jellyfin version to build
+        type: choice
+        options: [both, stable, unstable]
+        default: both
+  # Uncomment to also rebuild automatically every Monday at 04:00 UTC
+  # schedule:
+  #   - cron: '0 4 * * 1'
+
+env:
+  # Branches of this fork whose commits on top of jellyfin master get applied to every build
+  PATCH_BRANCHES: fix/strm-download
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Find latest stable release
+        id: matrix
+        env:
+          CHANNEL: ${{ inputs.channel || 'both' }}
+        run: |
+          # Newest release branch that already has an official image (new branches are cut before release)
+          for branch in $(git ls-remote --heads https://github.com/jellyfin/jellyfin.git 'release-*' \
+              | awk '{sub("refs/heads/", "", $2); print $2}' | sort -rV); do
+            version=${branch#release-}
+            version=${version%.z}
+            if docker manifest inspect "jellyfin/jellyfin:$version" > /dev/null 2>&1; then
+              break
+            fi
+          done
+          echo "Stable: $branch (jellyfin/jellyfin:$version)"
+
+          matrix=$(jq -cn --arg channel "$CHANNEL" --arg branch "$branch" --arg version "$version" '{include: [
+            (if $channel != "unstable" then {channel: "stable", branch: $branch, base_image: "jellyfin/jellyfin:\($version)"} else empty end),
+            (if $channel != "stable" then {channel: "unstable", branch: "master", base_image: "jellyfin/jellyfin:unstable"} else empty end)
+          ]}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.channel }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout Jellyfin
+        uses: actions/checkout@v4
+        with:
+          repository: jellyfin/jellyfin
+          ref: ${{ matrix.branch }}
+          path: src
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Apply patches
+        id: patch
+        working-directory: src
+        env:
+          BRANCH: ${{ matrix.branch }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          upstream=$(git rev-parse --short HEAD)
+
+          echo "### $CHANNEL: jellyfin/jellyfin \`$BRANCH\` @ \`$upstream\`" >> "$GITHUB_STEP_SUMMARY"
+          for patch in $PATCH_BRANCHES; do
+            git fetch --quiet "https://github.com/$GITHUB_REPOSITORY.git" "$patch"
+            commits=$(git rev-list --reverse --no-merges origin/master..FETCH_HEAD)
+            if [ -z "$commits" ]; then
+              echo "::warning::$patch has no commits on top of jellyfin master"
+              continue
+            fi
+            if ! git cherry-pick $commits; then
+              git cherry-pick --abort
+              echo "::error::$patch does not apply cleanly to $BRANCH. Rebase it on the latest jellyfin master."
+              exit 1
+            fi
+            git log --format="- \`%h\` %s ($patch)" -n "$(wc -w <<< "$commits")" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/jellyfin"
+          tags="$image:$CHANNEL,$image:$CHANNEL-$(date -u +%Y%m%d)-$upstream"
+          echo "Tags: \`${tags//,/\`, \`}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "dotnet=$(jq -r .sdk.version global.json | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: ci/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.patch.outputs.tags }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            DOTNET_VERSION=${{ steps.patch.outputs.dotnet }}
+            PATCHES=${{ env.PATCH_BRANCHES }}
+            UPSTREAM_REF=${{ steps.patch.outputs.upstream }}
